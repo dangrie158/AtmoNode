@@ -6,6 +6,7 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266mDNS.h>
 #include <DNSServer.h>
+#include <ArduinoOTA.h>
 
 #include <WiFiManager.h>
 
@@ -18,7 +19,7 @@
 
 #include "icons.h"
 
-U8G2_SSD1306_64X32_1F_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
+U8G2_SSD1306_64X32_1F_F_HW_I2C display(DISP_ROT, U8X8_PIN_NONE);
 Adafruit_BME280 bme;
 Adafruit_Sensor *bme_temp = bme.getTemperatureSensor();
 Adafruit_Sensor *bme_pressure = bme.getPressureSensor();
@@ -41,6 +42,7 @@ const static uint8_t portalButton = 2; //GPIO 2
 //flag for saving data
 bool shouldSaveConfig = false;
 
+void setupOTA();
 void delayWhileCheckingButtons(uint32_t time);
 void saveConfigCallback();
 void checkButtons();
@@ -78,6 +80,8 @@ void setup()
   {
     saveWLANConfig();
   }
+
+  setupOTA();
 
   io = new AdafruitIO_WiFi(adafruit_io_username, adafruit_io_key, "", "");
 
@@ -119,11 +123,6 @@ void setup()
 
 void loop()
 {
-  // io->run(); is required for all sketches.
-  // it should always be present at the top of your loop
-  // function. it keeps the client connected to
-  // io->adafruit.com, and processes any incoming data.
-  io->run();
 
   Serial.print("Sensing for room ");
   Serial.println(room);
@@ -158,13 +157,50 @@ void loop()
   }
 }
 
+void setupOTA()
+{
+  ArduinoOTA.onStart([]() {
+    displayMessage(1, updateIcon, "update in", "progress");
+  });
+  ArduinoOTA.onEnd([]() {
+    displayMessage(1000, updateIcon, "done", "restarting");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+
+    displayMessage(0, updateIcon, "Progress", String(String(progress / (total / 100), 10) + "%").c_str());
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR)
+      Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR)
+      Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR)
+      Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR)
+      Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR)
+      Serial.println("End Failed");
+  });
+  ArduinoOTA.begin();
+}
+
 void delayWhileCheckingButtons(uint32_t time)
 {
   uint32_t start = millis();
   while (millis() - start < time)
   {
+    // io->run(); is required for all sketches.
+    // it should always be present at the top of your loop
+    // function. it keeps the client connected to
+    // io->adafruit.com, and processes any incoming data.
+    io->run();
+
+    // Handle OTA update server
+    ArduinoOTA.handle();
+
     checkButtons();
-    delay(10);
   }
 }
 
@@ -226,10 +262,15 @@ void loadWLANConfig()
         configFile.close();
       }
     }
+    else
+    {
+      wifiManager.resetSettings();
+    }
   }
   else
   {
     Serial.println("failed to mount FS");
+    wifiManager.resetSettings();
   }
 }
 
