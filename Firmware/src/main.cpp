@@ -10,7 +10,7 @@
 
 #include <WiFiManager.h>
 
-#include <AdafruitIO_WiFi.h>
+#include <PubSubClient.h>
 
 #include <LittleFS.h>
 #include <Ticker.h>
@@ -27,14 +27,10 @@ Adafruit_Sensor *bme_humidity = bme.getHumiditySensor();
 
 WiFiManager wifiManager;
 WiFiClient client;
-char adafruit_io_username[40] = "";
-char adafruit_io_key[40] = "";
+char mqtt_server[40] = "nodeserver.local";
 char room[40] = "";
 
-AdafruitIO_WiFi *io;
-AdafruitIO_Feed *humidity;
-AdafruitIO_Feed *temperature;
-AdafruitIO_Feed *pressure;
+PubSubClient mqtt(client);
 
 const static uint8_t resetButton = 0;  //GPIO 0
 const static uint8_t portalButton = 2; //GPIO 2
@@ -50,6 +46,7 @@ void loadWLANConfig();
 void saveWLANConfig();
 void setupWLAN();
 void displayPrintCenterln(const char *text, uint8_t y);
+void createInfluxMessage(char *dst, uint8_t len, const char *topic, float value, uint8_t precision);
 void displayMessage(uint16_t duration, const uint8_t *icon, const char *message1, const char *message2 = "");
 void displayMeasurement(uint16_t duration, const uint8_t *icon, const char *measurement, const char *unit);
 
@@ -83,30 +80,7 @@ void setup()
 
   setupOTA();
 
-  io = new AdafruitIO_WiFi(adafruit_io_username, adafruit_io_key, "", "");
-
-  Serial.println("Connecting to Adafruit IO");
-  displayMessage(2000, connectIcon, "AdafruitIO", "connecting");
-  io->connect();
-
-  // wait for a connection
-  aio_status_t lastStatus = AIO_IDLE, newStatus = AIO_IDLE;
-  while (io->status() < AIO_CONNECTED)
-  {
-    aio_status_t newStatus = io->status();
-    if (newStatus != lastStatus)
-    {
-      lastStatus = newStatus;
-      auto statusText = io->statusText();
-      Serial.println(io->statusText());
-      displayMessage(0, connectIcon, String(statusText).c_str());
-    }
-  }
-
-  String room_str = String(room);
-  humidity = io->feed(String(room_str + ".Humidity").c_str());
-  temperature = io->feed(String(room_str + ".Temperature").c_str());
-  pressure = io->feed(String(room_str + ".Pressure").c_str());
+  mqtt.setServer(mqtt_server, 1883);
 
   if (!bme.begin(BME280_ADDRESS_ALTERNATE))
   {
@@ -123,6 +97,22 @@ void setup()
 
 void loop()
 {
+
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    displayMessage(5000, connectIcon, "disconnected", "resetting");
+    ESP.reset();
+  }
+
+  if (!mqtt.connected())
+  {
+    String clientId = String("AtmoNode-") + room;
+    if (!mqtt.connect(clientId.c_str()))
+    {
+      displayMessage(5000, connectIcon, "MQTT failed", "retrying");
+      return;
+    }
+  }
 
   Serial.print("Sensing for room ");
   Serial.println(room);
@@ -142,16 +132,39 @@ void loop()
   Serial.print(F("Pressure = "));
   Serial.print(pressure_event.pressure);
   Serial.println(" hPa");
+  yield();
 
-  temperature->save(temp_event.temperature);
-  humidity->save(humidity_event.relative_humidity);
-  pressure->save(pressure_event.pressure);
+  // streaming sensor data
+  String baseTopic = String("atmonode/") + room + "/";
+  mqtt.publish(String(baseTopic + "temperature").c_str(), String(temp_event.temperature, 1).c_str());
+  mqtt.publish(String(baseTopic + "humidity").c_str(), String(humidity_event.relative_humidity, 1).c_str());
+  mqtt.publish(String(baseTopic + "pressure").c_str(), String(pressure_event.pressure, 0).c_str());
+  yield();
+
+  // messages for storing the data in influxdb
+  const char *persistentTopic = "atmonode";
+  char messageBuffer[50] = {0};
+  createInfluxMessage(messageBuffer, 50, "temperature", temp_event.temperature, 1);
+  mqtt.publish(persistentTopic, messageBuffer);
+
+  createInfluxMessage(messageBuffer, 50, "humidity", humidity_event.relative_humidity, 1);
+  mqtt.publish(persistentTopic, messageBuffer);
+
+  createInfluxMessage(messageBuffer, 50, "pressure", pressure_event.pressure, 0);
+  mqtt.publish(persistentTopic, messageBuffer);
+  yield();
+
   for (uint8_t i = 0; i < 6; i++)
   {
+    yield();
     displayMeasurement(3000, humidityIcon, String(humidity_event.relative_humidity, 1).c_str(), "Rh");
     delayWhileCheckingButtons(2000);
+
+    yield();
     displayMeasurement(3000, temperatureIcon, String(temp_event.temperature, 1).c_str(), "°C");
     delayWhileCheckingButtons(2000);
+
+    yield();
     displayMeasurement(3000, pressureIcon, String(pressure_event.pressure, 0).c_str(), "hPa");
     delayWhileCheckingButtons(2000);
   }
@@ -160,15 +173,15 @@ void loop()
 void setupOTA()
 {
   ArduinoOTA.onStart([]() {
-    displayMessage(1, updateIcon, "update in", "progress");
+    displayMessage(1, warningIcon, "update in", "progress");
   });
   ArduinoOTA.onEnd([]() {
-    displayMessage(1000, updateIcon, "done", "restarting");
+    displayMessage(1000, warningIcon, "done", "restarting");
   });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
     Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
 
-    displayMessage(0, updateIcon, "Progress", String(String(progress / (total / 100), 10) + "%").c_str());
+    displayMessage(0, warningIcon, "Progress", String(String(progress / (total / 100), 10) + "%").c_str());
   });
   ArduinoOTA.onError([](ota_error_t error) {
     Serial.printf("Error[%u]: ", error);
@@ -191,16 +204,11 @@ void delayWhileCheckingButtons(uint32_t time)
   uint32_t start = millis();
   while (millis() - start < time)
   {
-    // io->run(); is required for all sketches.
-    // it should always be present at the top of your loop
-    // function. it keeps the client connected to
-    // io->adafruit.com, and processes any incoming data.
-    io->run();
-
     // Handle OTA update server
     ArduinoOTA.handle();
 
     checkButtons();
+    delay(5);
   }
 }
 
@@ -254,9 +262,10 @@ void loadWLANConfig()
         else
         {
           Serial.println("\nparsed json");
-
-          strcpy(adafruit_io_username, doc["adafruit_io_username"]);
-          strcpy(adafruit_io_key, doc["adafruit_io_key"]);
+          if (doc.containsKey("mqtt_server"))
+          {
+            strcpy(mqtt_server, doc["mqtt_server"]);
+          }
           strcpy(room, doc["room"]);
         }
         configFile.close();
@@ -278,8 +287,7 @@ void saveWLANConfig()
 {
   Serial.println("saving config");
   DynamicJsonDocument doc(512);
-  doc["adafruit_io_username"] = adafruit_io_username;
-  doc["adafruit_io_key"] = adafruit_io_key;
+  doc["mqtt_server"] = mqtt_server;
   doc["room"] = room;
 
   File configFile = LittleFS.open("/config.json", "w");
@@ -296,15 +304,13 @@ void saveWLANConfig()
 void setupWLAN()
 {
   // auto-manage wifi configuration
-  WiFiManagerParameter adafruit_io_username_param("Adafruit IO Username", "username", adafruit_io_username, 32);
-  WiFiManagerParameter adafruit_io_key_param("Adafruit IO Key", "key", adafruit_io_key, 32);
+  WiFiManagerParameter mqtt_server_param("MQTT Server", "IP or hostname", mqtt_server, 32);
   WiFiManagerParameter room_param("Room", "room", room, 32);
 
   //set config save notify callback
   wifiManager.setSaveConfigCallback(saveConfigCallback);
 
-  wifiManager.addParameter(&adafruit_io_username_param);
-  wifiManager.addParameter(&adafruit_io_key_param);
+  wifiManager.addParameter(&mqtt_server_param);
   wifiManager.addParameter(&room_param);
 
   // create a unique SSID
@@ -339,8 +345,7 @@ void setupWLAN()
   }
 
   //read updated parameters
-  strcpy(adafruit_io_username, adafruit_io_username_param.getValue());
-  strcpy(adafruit_io_key, adafruit_io_key_param.getValue());
+  strcpy(mqtt_server, mqtt_server_param.getValue());
   strcpy(room, room_param.getValue());
 
   Serial.println("connected...");
@@ -351,6 +356,21 @@ void setupWLAN()
   displayMessage(2000, wlanIcon, WiFi.SSID().c_str());
 
   display.clearBuffer();
+}
+
+void createInfluxMessage(char *dst, uint8_t len, const char *topic, float value, uint8_t precision)
+{
+  uint8_t pos = 0;
+  strncpy(dst + pos, topic, len - pos);
+  pos += strlen(topic);
+  strncpy(dst + pos, ",site=", len - pos);
+  pos += 6;
+  strncpy(dst + pos, room, len - pos);
+  pos += strlen(room);
+  strncpy(dst + pos, " value=", len - pos);
+  pos += 7;
+  String val_str = String(value, precision);
+  strncpy(dst + pos, val_str.c_str(), len - pos);
 }
 
 void displayMessage(uint16_t duration, const uint8_t *icon, const char *message1, const char *message2)
