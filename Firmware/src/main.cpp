@@ -27,7 +27,7 @@ Adafruit_Sensor *bme_humidity = bme.getHumiditySensor();
 
 WiFiManager wifiManager;
 WiFiClient client;
-char mqtt_server[40] = "nodeserver.local";
+char mqtt_server[40] = "grafana.local";
 char room[40] = "";
 
 PubSubClient mqtt(client);
@@ -121,6 +121,8 @@ void loop()
   bme_pressure->getEvent(&pressure_event);
   bme_humidity->getEvent(&humidity_event);
 
+  temp_event.temperature = temp_event.temperature - BME_WARMING_OFFSET;
+
   Serial.print(F("Temperature = "));
   Serial.print(temp_event.temperature);
   Serial.println(" *C");
@@ -152,22 +154,18 @@ void loop()
 
   createInfluxMessage(messageBuffer, 50, "pressure", pressure_event.pressure, 0);
   mqtt.publish(persistentTopic, messageBuffer);
+
   yield();
+  displayMeasurement(3000, humidityIcon, String(humidity_event.relative_humidity, 1).c_str(), "Rh");
+  delayWhileCheckingButtons(2000);
 
-  for (uint8_t i = 0; i < 6; i++)
-  {
-    yield();
-    displayMeasurement(3000, humidityIcon, String(humidity_event.relative_humidity, 1).c_str(), "Rh");
-    delayWhileCheckingButtons(2000);
+  yield();
+  displayMeasurement(3000, temperatureIcon, String(temp_event.temperature, 1).c_str(), "°C");
+  delayWhileCheckingButtons(2000);
 
-    yield();
-    displayMeasurement(3000, temperatureIcon, String(temp_event.temperature, 1).c_str(), "°C");
-    delayWhileCheckingButtons(2000);
-
-    yield();
-    displayMeasurement(3000, pressureIcon, String(pressure_event.pressure, 0).c_str(), "hPa");
-    delayWhileCheckingButtons(2000);
-  }
+  yield();
+  displayMeasurement(3000, pressureIcon, String(pressure_event.pressure, 0).c_str(), "hPa");
+  delayWhileCheckingButtons(2000);
 }
 
 void setupOTA()
@@ -331,7 +329,7 @@ void setupWLAN()
   }
 
   displayMessage(5000, wlanIcon, apSSID.c_str(), apPasscode.c_str());
-
+  wifiManager.setTimeout(60);
   bool success = wifiManager.autoConnect(apSSID.c_str(), apPasscode.c_str());
 
   if (!success)
